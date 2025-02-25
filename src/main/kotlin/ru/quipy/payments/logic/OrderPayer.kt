@@ -22,7 +22,7 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        if (!paymentService.canAcceptPayment(deadline)) {
+        if (!paymentService.canAcceptPayment(amount, deadline)) {
             throw HttpException("Payment service can't accept a new payment", HttpStatus.TOO_MANY_REQUESTS)
         }
 

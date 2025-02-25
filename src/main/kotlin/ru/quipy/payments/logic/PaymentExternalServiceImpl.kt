@@ -38,11 +38,11 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val price = properties.price
 
     private val client = OkHttpClient.Builder().build()
 
     private val requestsQueue = PriorityBlockingQueue<PendingRequest>(parallelRequests)
-    private val requestsInFlight = 0
     private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1), parallelRequests)
 
     private val coreExecutor = ThreadPoolExecutor(
@@ -129,12 +129,16 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
-    override fun canAcceptPayment(deadline: Long): Boolean {
+    override fun canAcceptPayment(amount: Int, deadline: Long): Boolean {
+        if (amount - price < amount * 0.93 && requestsQueue.size >= rateLimitPerSec) {
+            return false
+        }
+
         if (!rateLimiter.tick()) {
             return false
         }
 
-        return now() + requestsQueue.size / rateLimitPerSec * 1000 + 1000 + requestAverageProcessingTime.toMillis() < deadline
+        return now() + requestsQueue.size / rateLimitPerSec * 1000 + requestAverageProcessingTime.toMillis() < deadline
     }
 
 }
