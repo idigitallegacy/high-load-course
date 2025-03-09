@@ -3,6 +3,7 @@ Content-Type: application/json
 
 {
   "serviceName": "onlineStore",
-  "testCount": 1200,
-  "ratePerSecond": 11
+  "testCount": 100,
+  "processingTimeMillis": 60000,
+  "ratePerSecond": 2
 }

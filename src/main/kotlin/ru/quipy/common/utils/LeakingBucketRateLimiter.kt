@@ -28,8 +28,6 @@ class LeakingBucketRateLimiter(
         }
     }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
 
-    suspend fun run() = releaseJob
-
     companion object {
         private val logger: Logger = LoggerFactory.getLogger(LeakingBucketRateLimiter::class.java)
     }
