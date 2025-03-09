@@ -1,7 +1,8 @@
 package ru.quipy.payments.logic
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
@@ -9,13 +10,11 @@ import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.payments.dto.PendingRequest
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.PriorityBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.*
 
 
 // Advice: always treat time as a Duration
@@ -23,12 +22,12 @@ class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 ) : PaymentExternalSystemAdapter {
+    private val scheduledExecutorScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
-        val mapper = ObjectMapper().registerKotlinModule()
     }
 
     private val serviceName = properties.serviceName
@@ -40,6 +39,8 @@ class PaymentExternalSystemAdapterImpl(
     private val requestsQueue = PriorityBlockingQueue<PendingRequest>(parallelRequests)
     private val rateLimiter =
         LeakingBucketRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1), parallelRequests)
+
+    private val coreRateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1), rateLimitPerSec)
 
     private val coreExecutor = ThreadPoolExecutor(
         parallelRequests,
@@ -64,34 +65,32 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun submitPayments() {
-        for (i in 1..rateLimitPerSec) {
-            val paymentRequest = requestsQueue.poll()
+        if (requestsQueue.peek() === null || !coreRateLimiter.tick()) {
+            return
+        }
 
-            if (paymentRequest === null) {
-                return
-            }
+        val paymentRequest = requestsQueue.poll()
 
-            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-            paymentESService.update(paymentRequest.paymentId) {
-                it.logSubmission(
-                    success = true,
-                    paymentRequest.transactionId,
-                    now(),
-                    Duration.ofMillis(now() - paymentRequest.paymentStartedAt)
-                )
-            }
-
-            coreExecutor.submit {
-                try {
-                    val body = paymentRequest.call()
-
-                    paymentESService.update(paymentRequest.paymentId) {
-                        it.logProcessing(body.result, now(), paymentRequest.transactionId, reason = body.message)
-                    }
-                } catch (e: Exception) {
-                    handleException(paymentRequest, e)
+        coreExecutor.submit {
+            try {
+                // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
+                // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+                paymentESService.update(paymentRequest.paymentId) {
+                    it.logSubmission(
+                        success = true,
+                        paymentRequest.transactionId,
+                        now(),
+                        Duration.ofMillis(now() - paymentRequest.paymentStartedAt)
+                    )
                 }
+
+                val body = paymentRequest.call()
+
+                paymentESService.update(paymentRequest.paymentId) {
+                    it.logProcessing(body.result, now(), paymentRequest.transactionId, reason = body.message)
+                }
+            } catch (e: Exception) {
+                handleException(paymentRequest, e)
             }
         }
     }
@@ -132,6 +131,12 @@ class PaymentExternalSystemAdapterImpl(
                     it.logProcessing(false, now(), paymentRequest.transactionId, reason = e.message)
                 }
             }
+        }
+    }
+
+    private val releaseJob = scheduledExecutorScope.launch {
+        while (true) {
+            submitPayments()
         }
     }
 }
