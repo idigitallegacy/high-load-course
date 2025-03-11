@@ -2,12 +2,15 @@ package ru.quipy.payments.logic
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.exceptions.RETRIABLE_PROCESSING_FAIL_REASONS
+import ru.quipy.common.utils.exceptions.RequestProcessingException
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.dto.PendingRequest
@@ -15,7 +18,9 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
 
 
@@ -60,7 +65,7 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         val pendingRequest =
-            PendingRequest(transactionId, paymentId, amount, paymentStartedAt, deadline, accountName, request)
+            PendingRequest(transactionId, paymentId, amount, paymentStartedAt, deadline, accountName, request, getMaxRetries(amount, deadline))
         requestsQueue.add(pendingRequest)
     }
 
@@ -71,21 +76,15 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        if (inFlightRequests.incrementAndGet() > parallelRequests) {
-            inFlightRequests.decrementAndGet()
-            requestsQueue.add(paymentRequest)
+        coreExecutor.execute {
+            outgoingRateLimiter.tickBlocking()
 
-            return
-        }
+            // awaiting for parallel requests to be completed
+            while (inFlightRequests.get() >= parallelRequests) {
+            }
 
-        if (!outgoingRateLimiter.tick()) {
-            inFlightRequests.decrementAndGet()
-            requestsQueue.add(paymentRequest)
+            inFlightRequests.incrementAndGet()
 
-            return
-        }
-
-        coreExecutor.submit {
             try {
                 // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
                 // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
@@ -138,6 +137,20 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
 
+            is RequestProcessingException -> {
+                logger.error(
+                    "[$accountName] Request processing failed for txId: ${paymentRequest.transactionId}, payment: ${paymentRequest.paymentId}. Reason: ${e.failReason}. Message: ${e.message}"
+                )
+
+                paymentESService.update(paymentRequest.paymentId) {
+                    it.logProcessing(false, now(), paymentRequest.transactionId, reason = e.message)
+                }
+
+                if (RETRIABLE_PROCESSING_FAIL_REASONS.contains(e.failReason)) {
+                    requestsQueue.add(paymentRequest)
+                }
+            }
+
             else -> {
                 logger.error(
                     "[$accountName] Payment failed for txId: ${paymentRequest.transactionId}, payment: ${paymentRequest.paymentId}",
@@ -162,6 +175,13 @@ class PaymentExternalSystemAdapterImpl(
         val providerRps = 1 / requestAverageProcessingTime.toSeconds().toDouble() * rateLimitPerSec.toDouble()
 
         return min(ownRps, providerRps)
+    }
+
+    private fun getMaxRetries(amount: Int, deadline: Long): AtomicLong {
+        val maxRetriesByAmount = (amount / price()).toLong()
+        val maxRetriesByDeadline = (deadline - now()) / requestAverageProcessingTime.toMillis()
+
+        return AtomicLong(min(maxRetriesByAmount, maxRetriesByDeadline))
     }
 }
 
