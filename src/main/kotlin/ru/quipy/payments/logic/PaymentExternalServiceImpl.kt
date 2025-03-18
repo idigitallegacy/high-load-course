@@ -1,21 +1,22 @@
 package ru.quipy.payments.logic
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.NamedThreadFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.payments.dto.PendingRequest
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.PriorityBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.min
 
 
 // Advice: always treat time as a Duration
@@ -23,12 +24,12 @@ class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 ) : PaymentExternalSystemAdapter {
+    private val scheduledExecutorScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
-        val mapper = ObjectMapper().registerKotlinModule()
     }
 
     private val serviceName = properties.serviceName
@@ -38,8 +39,8 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val requestsQueue = PriorityBlockingQueue<PendingRequest>(parallelRequests)
-    private val rateLimiter =
-        LeakingBucketRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1), parallelRequests)
+    private val outgoingRateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1L))
+    private val inFlightRequests = AtomicInteger(0)
 
     private val coreExecutor = ThreadPoolExecutor(
         parallelRequests,
@@ -64,34 +65,49 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun submitPayments() {
-        for (i in 1..rateLimitPerSec) {
-            val paymentRequest = requestsQueue.poll()
+        val paymentRequest = requestsQueue.poll()
 
-            if (paymentRequest === null) {
-                return
-            }
+        if (paymentRequest === null) {
+            return
+        }
 
-            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-            paymentESService.update(paymentRequest.paymentId) {
-                it.logSubmission(
-                    success = true,
-                    paymentRequest.transactionId,
-                    now(),
-                    Duration.ofMillis(now() - paymentRequest.paymentStartedAt)
-                )
-            }
+        if (inFlightRequests.incrementAndGet() > parallelRequests) {
+            inFlightRequests.decrementAndGet()
+            requestsQueue.add(paymentRequest)
 
-            coreExecutor.submit {
-                try {
-                    val body = paymentRequest.call()
+            return
+        }
 
-                    paymentESService.update(paymentRequest.paymentId) {
-                        it.logProcessing(body.result, now(), paymentRequest.transactionId, reason = body.message)
-                    }
-                } catch (e: Exception) {
-                    handleException(paymentRequest, e)
+        if (!outgoingRateLimiter.tick()) {
+            inFlightRequests.decrementAndGet()
+            requestsQueue.add(paymentRequest)
+
+            return
+        }
+
+        coreExecutor.submit {
+            try {
+                // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
+                // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+                paymentESService.update(paymentRequest.paymentId) {
+                    it.logSubmission(
+                        success = true,
+                        paymentRequest.transactionId,
+                        now(),
+                        Duration.ofMillis(now() - paymentRequest.paymentStartedAt)
+                    )
                 }
+
+                val body = paymentRequest.call()
+
+                paymentESService.update(paymentRequest.paymentId) {
+                    it.logProcessing(body.result, now(), paymentRequest.transactionId, reason = body.message)
+                }
+
+                inFlightRequests.decrementAndGet()
+            } catch (e: Exception) {
+                handleException(paymentRequest, e)
+                inFlightRequests.decrementAndGet()
             }
         }
     }
@@ -102,12 +118,12 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
-    override fun canAcceptPayment(amount: Int, deadline: Long): Boolean {
-        if (!rateLimiter.tick()) {
-            return false
+    override fun canAcceptPayment(deadline: Long): Boolean {
+        if (deadline.toDouble() < now().toDouble() + (requestsQueue.size + 1).toDouble() / selectMaxRps() * 1000) {
+            throw IllegalStateException("Time limits for $accountName breached")
         }
 
-        return now() + requestsQueue.size / rateLimitPerSec * 1000 + requestAverageProcessingTime.toMillis() < deadline
+        return true
     }
 
     private fun handleException(paymentRequest: PendingRequest, e: Exception) {
@@ -133,6 +149,19 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         }
+    }
+
+    private val releaseJob = scheduledExecutorScope.launch {
+        while (true) {
+            submitPayments()
+        }
+    }
+
+    private fun selectMaxRps(): Double {
+        val ownRps = rateLimitPerSec.toDouble()
+        val providerRps = 1 / requestAverageProcessingTime.toSeconds().toDouble() * rateLimitPerSec.toDouble()
+
+        return min(ownRps, providerRps)
     }
 }
 

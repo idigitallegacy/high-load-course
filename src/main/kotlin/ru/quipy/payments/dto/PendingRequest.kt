@@ -1,9 +1,11 @@
-package ru.quipy.payments.logic
+package ru.quipy.payments.dto
 
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import ru.quipy.payments.logic.PaymentExternalSystemAdapterImpl.Companion.logger
-import ru.quipy.payments.logic.PaymentExternalSystemAdapterImpl.Companion.mapper
+import org.slf4j.LoggerFactory
+import ru.quipy.payments.logic.ExternalSysResponse
 import java.util.*
 import java.util.concurrent.Callable
 
@@ -16,6 +18,11 @@ class PendingRequest(
     val accountName: String,
     val rawRequest: Request
 ) : Comparable<PendingRequest>, Callable<ExternalSysResponse> {
+    companion object {
+        val logger = LoggerFactory.getLogger(PendingRequest::class.java)
+        val mapper = ObjectMapper().registerKotlinModule()
+    }
+
     private val client = OkHttpClient.Builder().build()
 
     override fun compareTo(other: PendingRequest): Int {
