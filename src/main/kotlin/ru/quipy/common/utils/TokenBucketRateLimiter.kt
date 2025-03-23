@@ -50,4 +50,8 @@ class TokenBucketRateLimiter(
             }
         }
     }
+
+    override fun tickBlocking() {
+        TODO("Not yet implemented")
+    }
 }
