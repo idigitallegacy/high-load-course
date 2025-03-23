@@ -6,6 +6,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
 import java.time.Duration
 import java.util.*
+import kotlin.math.abs
 
 open class InFlightRequest(
     val previousStateRequest: PendingRequest,
@@ -15,7 +16,11 @@ open class InFlightRequest(
     private val exceptionHandler: (paymentRequest: PendingRequest, e: Exception) -> Unit
 ) : Comparable<InFlightRequest>, Runnable {
     override fun compareTo(other: InFlightRequest): Int {
-        return previousStateRequest.compareTo(other.previousStateRequest)
+        if (equalsWithThreshold(timeout, other.timeout, 100)) {
+            return previousStateRequest.compareTo(other.previousStateRequest)
+        }
+
+        return timeout.compareTo(other.timeout)
     }
 
     var submissionTime: Long = 0
@@ -48,4 +53,7 @@ open class InFlightRequest(
         }
     }
 
+    private fun equalsWithThreshold(a: Long, b: Long, threshold: Long): Boolean {
+        return abs(a.compareTo(b)) < threshold
+    }
 }
