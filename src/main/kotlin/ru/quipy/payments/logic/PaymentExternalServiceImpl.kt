@@ -2,11 +2,11 @@ package ru.quipy.payments.logic
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.common.utils.exceptions.RETRIABLE_PROCESSING_FAIL_REASONS
@@ -18,7 +18,6 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.*
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
@@ -53,7 +52,8 @@ class PaymentExternalSystemAdapterImpl(
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(),
-        NamedThreadFactory("payment-submission-executor")
+        NamedThreadFactory("payment-submission-executor"),
+        CallerBlockingRejectedExecutionHandler()
     )
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
