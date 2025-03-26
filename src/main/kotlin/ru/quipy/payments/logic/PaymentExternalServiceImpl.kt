@@ -7,6 +7,8 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.*
 import ru.quipy.common.utils.exceptions.RETRIABLE_PROCESSING_FAIL_REASONS
 import ru.quipy.common.utils.exceptions.RequestProcessingException
+import ru.quipy.config.MAX_RETRIES_LIMIT
+import ru.quipy.config.MAX_THREADS_LIMIT
 import ru.quipy.config.SUCCESS_QUANTILE
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -48,8 +50,8 @@ class PaymentExternalSystemAdapterImpl(
     private val externalSystemAnalyzer = ExternalSystemAnalyzer()
 
     private val coreExecutor = ThreadPoolExecutor(
-        parallelRequests,
-        parallelRequests,
+        getThreadsAmount(),
+        getThreadsAmount(),
         0L,
         TimeUnit.MILLISECONDS,
         PriorityBlockingQueue(),
@@ -115,7 +117,7 @@ class PaymentExternalSystemAdapterImpl(
     override fun name() = properties.accountName
 
     override fun canAcceptPayment(deadline: Long): Boolean {
-        if (deadline.toDouble() < now().toDouble() + (requestsQueue.size + 1).toDouble() / selectMaxRps() * 1000 + getTimeout()) {
+        if (deadline.toDouble() < now().toDouble() + (requestsQueue.size + 1).toDouble() / selectMaxRps() * 1000.00 + getTimeout()) {
             throw IllegalStateException("Time limits for $accountName breached")
         }
 
@@ -163,7 +165,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun cleanup() {
-        while (requestsQueue.peek() !== null && requestsQueue.peek().deadline < now()) {
+        while (requestsQueue.peek() !== null && requestsQueue.peek().deadline + getTimeout() < now()) {
             val paymentRequest = requestsQueue.poll()
 
             paymentESService.update(paymentRequest.paymentId) {
@@ -174,8 +176,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val releaseJob = scheduledExecutorScope.launch {
         while (true) {
-            submitPayments()
             cleanup()
+            submitPayments()
             Thread.sleep(10L)
         }
     }
@@ -190,8 +192,9 @@ class PaymentExternalSystemAdapterImpl(
     private fun getMaxRetries(amount: Int, deadline: Long): AtomicLong {
         val maxRetriesByAmount = (amount / price()).toLong()
         val maxRetriesByDeadline = (deadline - now()) / requestAverageProcessingTime.toMillis()
+        val minRetries = min(maxRetriesByAmount, maxRetriesByDeadline)
 
-        return AtomicLong(min(maxRetriesByAmount, maxRetriesByDeadline))
+        return AtomicLong(min(MAX_RETRIES_LIMIT, minRetries))
     }
 
     private fun getTimeout(): Long {
@@ -199,6 +202,14 @@ class PaymentExternalSystemAdapterImpl(
         timeout = min(timeout, 2 * requestAverageProcessingTime.toMillis())
 
         return timeout
+    }
+
+    private fun getThreadsAmount(): Int {
+        val rpsPerThread = 1 / requestAverageProcessingTime.toMillis()
+        val requiredThreads = selectMaxRps() / rpsPerThread
+        val minRequiredThreads = min(parallelRequests.toDouble(), requiredThreads).toInt()
+
+        return min(MAX_THREADS_LIMIT, minRequiredThreads)
     }
 }
 

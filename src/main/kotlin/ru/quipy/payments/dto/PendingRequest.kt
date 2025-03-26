@@ -14,6 +14,7 @@ import ru.quipy.payments.logic.ExternalSysResponse
 import ru.quipy.payments.logic.PaymentExternalSystemAdapterImpl.Companion.emptyBody
 import java.util.*
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.abs
 
 class PendingRequest(
     val transactionId: UUID,
@@ -25,7 +26,7 @@ class PendingRequest(
     private val accountName: String,
 ) : Comparable<PendingRequest> {
     private val retriesAmount = AtomicLong(0)
-    private val retryAfter = AtomicLong(0)
+    private val retryAfter = AtomicLong(-1)
 
     companion object {
         val logger = LoggerFactory.getLogger(PendingRequest::class.java)
@@ -35,12 +36,12 @@ class PendingRequest(
     private val client = OkHttpClient.Builder().build()
 
     override fun compareTo(other: PendingRequest): Int {
-        if (retryAfter.get() != 0L && other.retryAfter.get() != 0L) {
-            return retryAfter.get().compareTo(other.retryAfter.get())
-        }
+        if (retryAfter.get() != -1L || other.retryAfter.get() != -1L) {
+            if (equalsWithThreshold(deadline, other.deadline, 100)) {
+                return retryAfter.get().compareTo(other.retryAfter.get())
+            }
 
-        if (retryAfter.get() != 0L) {
-            return retryAfter.get().toInt()
+            return retriesAmount.get().compareTo(other.retriesAmount.get())
         }
 
         return deadline.compareTo(other.deadline)
@@ -122,5 +123,9 @@ class PendingRequest(
 
             else -> RequestProcessingException(ProcessingFailReason.UNKNOWN)
         }
+    }
+
+    private fun equalsWithThreshold(a: Long, b: Long, threshold: Long): Boolean {
+        return abs(a.compareTo(b)) < threshold
     }
 }
