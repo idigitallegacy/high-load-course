@@ -7,4 +7,10 @@ class CompositeRateLimiter(
     override fun tick(): Boolean {
         return rl1.tick() && rl2.tick()
     }
+
+    override fun tickBlocking() {
+        while (!tick()) {
+            Thread.sleep(10L)
+        }
+    }
 }
