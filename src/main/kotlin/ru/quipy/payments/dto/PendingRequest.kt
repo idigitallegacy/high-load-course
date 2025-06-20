@@ -2,19 +2,16 @@ package ru.quipy.payments.dto
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import org.eclipse.jetty.http.HttpHeader
-import org.slf4j.LoggerFactory
+import okhttp3.*
 import ru.quipy.common.utils.exceptions.ProcessingFailReason
 import ru.quipy.common.utils.exceptions.RequestProcessingException
 import ru.quipy.payments.logic.ExternalSysResponse
 import ru.quipy.payments.logic.PaymentExternalSystemAdapterImpl.Companion.emptyBody
+import java.io.IOException
 import java.util.*
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.abs
+import ru.quipy.payments.logic.now
+import java.util.concurrent.CompletableFuture
 
 class PendingRequest(
     val transactionId: UUID,
@@ -24,68 +21,73 @@ class PendingRequest(
     val maxRetries: AtomicLong,
     val deadline: Long,
     private val accountName: String,
+    private val client: OkHttpClient,
 ) : Comparable<PendingRequest> {
     private val retriesAmount = AtomicLong(0)
-    private val retryAfter = AtomicLong(-1)
+    private val retryAfter = AtomicLong(0)
+
+    private lateinit var url: String;
+    private val createdAt = now()
 
     companion object {
-        val logger = LoggerFactory.getLogger(PendingRequest::class.java)
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
-    private val client = OkHttpClient.Builder().build()
-
     override fun compareTo(other: PendingRequest): Int {
-        if (retryAfter.get() != -1L || other.retryAfter.get() != -1L) {
-            if (equalsWithThreshold(deadline, other.deadline, 100)) {
-                return retryAfter.get().compareTo(other.retryAfter.get())
-            }
-
-            return retriesAmount.get().compareTo(other.retriesAmount.get())
-        }
-
-        return deadline.compareTo(other.deadline)
+        return createdAt.compareTo(other.createdAt)
     }
 
-    suspend fun call(url: String, timeout: Long): ExternalSysResponse {
+    fun call(
+        timeout: Long,
+        responseHandler: (ExternalSysResponse) -> Unit,
+        exceptionHandler: (PendingRequest, Throwable) -> Unit
+    ): CompletableFuture<Unit> {
         if (retriesAmount.incrementAndGet() >= maxRetries.get()) {
             throw RequestProcessingException(ProcessingFailReason.TOO_MANY_RETRIES, "Too Many Retries")
         }
 
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
-        logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
-
         val request = Request.Builder().run {
             url(url)
-            header(HttpHeader.KEEP_ALIVE.toString(), "timeout=$${timeout / 1000}")
             post(emptyBody)
         }.build()
 
-        val result = withTimeoutOrNull(timeout) {
-            return@withTimeoutOrNull client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    throw handleFailedResponse(response)
+        val future = CompletableFuture<Unit>()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onResponse(call: Call, response: Response) {
+                try {
+                    if (!response.isSuccessful) {
+                        exceptionHandler(this@PendingRequest, handleFailedResponse(response))
+                        future.completeExceptionally(handleFailedResponse(response))
+                        return
+                    }
+
+                    val body = safeGetBody(response)
+                    if (!body.result) {
+                        val ex = RequestProcessingException(ProcessingFailReason.UNKNOWN, body.message)
+                        exceptionHandler(this@PendingRequest, ex)
+                        future.completeExceptionally(ex)
+                        return
+                    }
+
+                    responseHandler(body)
+                    future.complete(Unit) // Явно возвращаем Unit
+                    response.close()
+                } catch (e: Exception) {
+                    future.completeExceptionally(e)
+                } finally {
+                    response.close() // Важно закрывать Response
                 }
-
-                val body = safeGetBody(response)
-
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                if (!body.result) {
-                    // successful response with failure
-                    throw RequestProcessingException(ProcessingFailReason.UNKNOWN, body.message)
-                }
-
-                return@use body
             }
-        }
 
-        if (result == null) {
-            throw RequestProcessingException(ProcessingFailReason.TIMEOUT, "Timeout reached.")
-        }
+            override fun onFailure(call: Call, e: IOException) {
+                exceptionHandler(this@PendingRequest,
+                    RequestProcessingException(ProcessingFailReason.UNKNOWN, e.message))
+                future.completeExceptionally(e)
+            }
+        })
 
-        return result
+        return future
     }
 
     fun setRetryAfter(delay: Long) {
@@ -98,8 +100,6 @@ class PendingRequest(
         try {
             return mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
         } catch (e: Exception) {
-            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${e.message}")
-
             return ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
         }
     }
@@ -125,7 +125,7 @@ class PendingRequest(
         }
     }
 
-    private fun equalsWithThreshold(a: Long, b: Long, threshold: Long): Boolean {
-        return abs(a.compareTo(b)) < threshold
+    fun setUrl(newUrl: String) {
+        url = newUrl;
     }
 }

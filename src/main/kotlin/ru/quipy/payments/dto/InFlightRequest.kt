@@ -1,59 +1,54 @@
 package ru.quipy.payments.dto
 
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.*
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
 import java.time.Duration
 import java.util.*
-import kotlin.math.abs
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
 
 open class InFlightRequest(
     val previousStateRequest: PendingRequest,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
-    private val url: String,
     private val timeout: Long,
-    private val exceptionHandler: (paymentRequest: PendingRequest, e: Exception) -> Unit
-) : Comparable<InFlightRequest>, Runnable {
+    private val exceptionHandler: (paymentRequest: PendingRequest, e: Throwable) -> Unit
+) : Comparable<InFlightRequest> {
     override fun compareTo(other: InFlightRequest): Int {
-        if (equalsWithThreshold(timeout, other.timeout, 100)) {
-            return previousStateRequest.compareTo(other.previousStateRequest)
-        }
-
-        return timeout.compareTo(other.timeout)
+        return previousStateRequest.compareTo(other.previousStateRequest)
     }
 
-    var submissionTime: Long = 0
-    var completionTime: Long = 0
-
-    override fun run() {
-        try {
-            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-            paymentESService.update(previousStateRequest.paymentId) {
-                it.logSubmission(
-                    success = true,
-                    previousStateRequest.transactionId,
-                    now(),
-                    Duration.ofMillis(now() - previousStateRequest.paymentStartedAt)
-                )
-            }
-
-            runBlocking {
-                submissionTime = now()
-                val body = previousStateRequest.call(url, timeout)
-                completionTime = now()
-
-                paymentESService.update(previousStateRequest.paymentId) {
-                    it.logProcessing(body.result, now(), previousStateRequest.transactionId, reason = body.message)
-                }
-            }
-        } catch (e: Exception) {
-            exceptionHandler(previousStateRequest, e)
+    fun run(): CompletableFuture<Unit> {
+        paymentESService.update(previousStateRequest.paymentId) {
+            val currentTime = now()
+            it.logSubmission(
+                success = true,
+                previousStateRequest.transactionId,
+                currentTime,
+                Duration.ofMillis(currentTime - previousStateRequest.paymentStartedAt)
+            )
         }
+
+        // 2. Параллельно выполняем основной вызов
+        val callFuture = previousStateRequest.call(
+            timeout = timeout,
+            responseHandler = ::responseHandler,
+            exceptionHandler = exceptionHandler
+        )
+
+        // 3. Комбинируем результаты
+        return callFuture
+            .thenApply { Unit } // Явное преобразование Void в Unit
+            .exceptionally { e ->
+                exceptionHandler(previousStateRequest, e ?: RuntimeException("Unknown error"))
+                Unit
+            }
     }
 
-    private fun equalsWithThreshold(a: Long, b: Long, threshold: Long): Boolean {
-        return abs(a.compareTo(b)) < threshold
+    private fun responseHandler(response: ExternalSysResponse) {
+        paymentESService.update(previousStateRequest.paymentId) {
+            it.logProcessing(response.result, now(), previousStateRequest.transactionId, reason = response.message)
+        }
     }
 }
